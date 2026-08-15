@@ -69,7 +69,7 @@ CREATE TABLE IF NOT EXISTS meta (
 );
 """)
 db.commit()
-for _col in ("auto_fetched_at TEXT", "fetch_error TEXT"):
+for _col in ("auto_fetched_at TEXT", "fetch_error TEXT", "author_handle TEXT", "has_media INTEGER", "mention_ok INTEGER"):
     try:
         db.execute(f"ALTER TABLE submissions ADD COLUMN {_col}")
         db.commit()
@@ -134,10 +134,13 @@ def fmt_pts(p):
     return f"{p:g}" if p == int(p) else f"{p:.1f}"
 
 
-# ---------- automatic metrics (X embed/syndication endpoint) ----------
-# Returns likes + replies for any public tweet without auth. Views and
-# RT/quote counts are NOT exposed here; those stay creator-reported at
-# the deadline (or move to the paid X API later).
+# ---------- automatic metrics ----------
+# Three free sources, in order of completeness:
+#   1. fxtwitter  — views, likes, replies, RTs, quotes, author, media, text
+#   2. vxtwitter  — likes, replies, RTs (fallback)
+#   3. X syndication endpoint — likes, replies only (last resort)
+# All community/embed services; if they break, the bot alerts mods and
+# /report opens as the manual fallback. Nothing here scrapes x.com itself.
 
 def _syn_token(tweet_id):
     n = (int(tweet_id) / 1e15) * math.pi
@@ -156,19 +159,68 @@ def _syn_token(tweet_id):
     return (a + f).replace("0", "").replace(".", "")
 
 
+_HDRS = {"User-Agent": "Mozilla/5.0"}
+_TIMEOUT = aiohttp.ClientTimeout(total=15)
+
+
+async def _get_json(session, url):
+    try:
+        async with session.get(url, headers=_HDRS, timeout=_TIMEOUT) as resp:
+            if resp.status != 200:
+                return None, f"http {resp.status}"
+            return await resp.json(content_type=None), None
+    except Exception as e:
+        return None, type(e).__name__
+
+
 async def fetch_tweet_metrics(session, tweet_id):
+    """Returns ({views, likes, replies, rtq, author, has_media, mention_ok}, err).
+    Fields the winning source doesn't expose are None (never overwrite with None)."""
+    data, err = await _get_json(session, f"https://api.fxtwitter.com/status/{tweet_id}")
+    if data and data.get("code") == 200 and data.get("tweet"):
+        t = data["tweet"]
+        text = (t.get("text") or "").lower()
+        return {
+            "views": t.get("views"),
+            "likes": t.get("likes") or 0,
+            "replies": t.get("replies") or 0,
+            "rtq": (t.get("retweets") or 0) + (t.get("quotes") or 0),
+            "author": (t.get("author") or {}).get("screen_name"),
+            "has_media": 1 if t.get("media") else 0,
+            "mention_ok": 1 if "@lesharxverse" in text else 0,
+        }, None
+    if data and data.get("code") == 404:
+        return None, "deleted or not found"
+
+    data, err2 = await _get_json(session, f"https://api.vxtwitter.com/i/status/{tweet_id}")
+    if data and data.get("likes") is not None:
+        text = (data.get("text") or "").lower()
+        return {
+            "views": data.get("viewCount"),
+            "likes": data.get("likes") or 0,
+            "replies": data.get("replies") or 0,
+            "rtq": data.get("retweets") or 0,
+            "author": data.get("user_screen_name"),
+            "has_media": 1 if data.get("mediaURLs") else 0,
+            "mention_ok": 1 if "@lesharxverse" in text else 0,
+        }, None
+
     url = f"https://cdn.syndication.twimg.com/tweet-result?id={tweet_id}&token={_syn_token(tweet_id)}"
-    async with session.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-        if resp.status != 200:
-            return None, f"http {resp.status}"
-        data = await resp.json()
+    data, err3 = await _get_json(session, url)
+    if data:
         if data.get("__typename") == "TweetTombstone":
             return None, "deleted or restricted"
-        likes = data.get("favorite_count")
-        replies = data.get("conversation_count")
-        if likes is None and replies is None:
-            return None, "no metrics in response"
-        return {"likes": int(likes or 0), "replies": int(replies or 0)}, None
+        if data.get("favorite_count") is not None or data.get("conversation_count") is not None:
+            return {
+                "views": None,
+                "likes": int(data.get("favorite_count") or 0),
+                "replies": int(data.get("conversation_count") or 0),
+                "rtq": None,
+                "author": ((data.get("user") or {}).get("screen_name")),
+                "has_media": 1 if data.get("mediaDetails") else None,
+                "mention_ok": None,
+            }, None
+    return None, err or err2 or err3 or "all sources failed"
 
 
 async def fetch_all_metrics():
@@ -183,8 +235,14 @@ async def fetch_all_metrics():
             except Exception as e:
                 metrics, err = None, str(e)[:80]
             if metrics:
-                db.execute("UPDATE submissions SET likes=?, replies=?, auto_fetched_at=?, fetch_error=NULL WHERE id=?",
-                           (metrics["likes"], metrics["replies"], now, r["id"]))
+                db.execute("""UPDATE submissions SET
+                                views=COALESCE(?, views), likes=COALESCE(?, likes),
+                                replies=COALESCE(?, replies), rtq=COALESCE(?, rtq),
+                                author_handle=COALESCE(?, author_handle),
+                                has_media=COALESCE(?, has_media), mention_ok=COALESCE(?, mention_ok),
+                                auto_fetched_at=?, fetch_error=NULL WHERE id=?""",
+                           (metrics["views"], metrics["likes"], metrics["replies"], metrics["rtq"],
+                            metrics["author"], metrics["has_media"], metrics["mention_ok"], now, r["id"]))
                 ok += 1
             else:
                 db.execute("UPDATE submissions SET fetch_error=? WHERE id=?", (err, r["id"]))
@@ -239,13 +297,40 @@ async def submit(inter: discord.Interaction, link: str):
         await inter.response.send_message(
             f"You've already submitted {DAILY_CAP} tweets today (UTC). Use `/withdraw` to swap one out.", ephemeral=True)
         return
+
+    await inter.response.defer(ephemeral=True)
+    async with aiohttp.ClientSession() as session:
+        try:
+            metrics, err = await fetch_tweet_metrics(session, tweet_id)
+        except Exception as e:
+            metrics, err = None, str(e)[:80]
+
+    if metrics is None and err == "deleted or not found":
+        await inter.followup.send("That tweet doesn't seem to exist (deleted, private account, or wrong link).", ephemeral=True)
+        return
+    if metrics and metrics["has_media"] == 0:
+        await inter.followup.send("Rule check: that tweet has **no image, GIF, or video** — visuals are mandatory. Post with a visual and resubmit.", ephemeral=True)
+        return
+    if metrics and metrics["mention_ok"] == 0:
+        await inter.followup.send("Rule check: that tweet doesn't **tag @LeSharXverse**. Tag us and resubmit.", ephemeral=True)
+        return
+
+    now = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
     db.execute("INSERT INTO submissions (user_id, user_name, url, tweet_id, day, created_at) VALUES (?,?,?,?,?,?)",
-               (inter.user.id, str(inter.user), canonical, tweet_id, day,
-                dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")))
+               (inter.user.id, str(inter.user), canonical, tweet_id, day, now))
+    if metrics:
+        db.execute("""UPDATE submissions SET views=?, likes=?, replies=?, rtq=?, author_handle=?,
+                      has_media=?, mention_ok=?, auto_fetched_at=? WHERE tweet_id=?""",
+                   (metrics["views"], metrics["likes"], metrics["replies"], metrics["rtq"],
+                    metrics["author"], metrics["has_media"], metrics["mention_ok"], now, tweet_id))
+    else:
+        db.execute("UPDATE submissions SET fetch_error=? WHERE tweet_id=?", (err, tweet_id))
     db.commit()
     left = DAILY_CAP - count - 1
-    await inter.response.send_message(
-        f"🦈 Submission {count + 1}/{DAILY_CAP} logged for today: {canonical}\n"
+    note = "✅ Rules checked (visual + tag) — metrics tracking has started." if metrics else \
+           "⚠️ Couldn't auto-check this tweet right now — a mod may verify it manually."
+    await inter.followup.send(
+        f"🦈 Submission {count + 1}/{DAILY_CAP} logged for today: {canonical}\n{note}\n"
         f"{left} slot{'s' if left != 1 else ''} left today. Quality > quantity!", ephemeral=True)
     if SUBMIT_CHANNEL_ID:
         ch = client.get_channel(SUBMIT_CHANNEL_ID)
@@ -280,12 +365,12 @@ async def mytweets(inter: discord.Interaction):
     lines = []
     for r in rows[-12:]:
         p = tweet_points(r["views"], r["likes"], r["replies"], r["rtq"])
-        if r["reported_at"]:
-            state = f"{fmt_pts(p)} pts (final)" + (" ✅" if r["verified"] else "")
-        elif tally_open():
-            state = f"{fmt_pts(p)} pts — add views/RTs with `/report`"
+        if r["verified"]:
+            state = f"{fmt_pts(p)} pts ✅"
+        elif r["fetch_error"] and tally_open():
+            state = f"{fmt_pts(p)} pts — needs `/report`"
         else:
-            state = f"{fmt_pts(p)} pts (live)"
+            state = f"{fmt_pts(p)} pts" + ("" if tally_open() else " (live)")
         lines.append(f"`{r['day']}` <{r['url']}> · {state}")
     e = discord.Embed(title="Your season", colour=BLUE, description="\n".join(lines))
     e.add_field(name="Total points", value=fmt_pts(pts))
@@ -295,50 +380,54 @@ async def mytweets(inter: discord.Interaction):
 
 
 class MetricsModal(discord.ui.Modal):
-    """Likes and replies are auto-fetched; creators only add the two
-    numbers the free endpoint can't see: views and RTs+quotes."""
+    """Manual fallback only — used when the auto-fetch couldn't read a tweet.
+    Prefilled with whatever the bot already knows."""
 
-    def __init__(self, sub_id, url):
-        super().__init__(title="Final numbers (views + RTs/quotes)")
+    def __init__(self, sub_id, row):
+        super().__init__(title="Enter this tweet's numbers")
         self.sub_id = sub_id
-        self.views = discord.ui.TextInput(label="Views", placeholder="e.g. 3400")
-        self.rtq = discord.ui.TextInput(label="Retweets + Quotes", placeholder="e.g. 11")
-        self.add_item(self.views)
-        self.add_item(self.rtq)
+        def field(label, val):
+            return discord.ui.TextInput(label=label, default="" if val is None else str(val), placeholder="0")
+        self.views = field("Views", row["views"])
+        self.likes = field("Likes", row["likes"])
+        self.replies = field("Replies", row["replies"])
+        self.rtq = field("Retweets + Quotes", row["rtq"])
+        for item in (self.views, self.likes, self.replies, self.rtq):
+            self.add_item(item)
 
     async def on_submit(self, inter: discord.Interaction):
         try:
-            vals = [int(str(x.value).replace(",", "").strip()) for x in (self.views, self.rtq)]
+            vals = [int(str(x.value).replace(",", "").strip() or 0) for x in (self.views, self.likes, self.replies, self.rtq)]
             if any(v < 0 for v in vals):
                 raise ValueError
         except ValueError:
             await inter.response.send_message("Numbers only, please — try `/report` again.", ephemeral=True)
             return
-        db.execute("UPDATE submissions SET views=?, rtq=?, reported_at=?, verified=0 WHERE id=?",
+        db.execute("UPDATE submissions SET views=?, likes=?, replies=?, rtq=?, reported_at=?, verified=0 WHERE id=?",
                    (*vals, dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"), self.sub_id))
         db.commit()
-        row = db.execute("SELECT views, likes, replies, rtq FROM submissions WHERE id=?", (self.sub_id,)).fetchone()
-        p = tweet_points(row["views"], row["likes"], row["replies"], row["rtq"])
+        p = tweet_points(*vals)
         await inter.response.send_message(
-            f"Recorded — that tweet now scores **{fmt_pts(p)} points** (likes and replies were tracked automatically). "
-            f"Run `/report` again for your next one.", ephemeral=True)
+            f"Recorded — that tweet scores **{fmt_pts(p)} points**. Run `/report` again if more are flagged.", ephemeral=True)
+
+
+PENDING_SQL = ("SELECT * FROM submissions WHERE user_id=? AND reported_at IS NULL AND "
+               "(fetch_error IS NOT NULL OR views IS NULL OR likes IS NULL OR replies IS NULL OR rtq IS NULL)")
 
 
 class ReportPicker(discord.ui.View):
     def __init__(self, user_id):
         super().__init__(timeout=300)
-        rows = db.execute(
-            "SELECT id, url, day FROM submissions WHERE user_id=? AND reported_at IS NULL ORDER BY day LIMIT 25",
-            (user_id,)).fetchall()
+        rows = db.execute(PENDING_SQL + " ORDER BY day LIMIT 25", (user_id,)).fetchall()
         options = [discord.SelectOption(label=f"{r['day']} — …{r['url'][-24:]}", value=str(r["id"])) for r in rows]
         self.select = discord.ui.Select(placeholder="Pick a tweet to enter metrics for", options=options)
         self.select.callback = self.picked
         self.add_item(self.select)
-        self.urls = {str(r["id"]): r["url"] for r in rows}
+        self.rows = {str(r["id"]): r for r in rows}
 
     async def picked(self, inter: discord.Interaction):
         sid = self.select.values[0]
-        await inter.response.send_modal(MetricsModal(int(sid), self.urls[sid]))
+        await inter.response.send_modal(MetricsModal(int(sid), self.rows[sid]))
 
 
 @tree.command(name="report", description="Enter your tweets' final metrics (deadline only)", guild=guild_obj)
@@ -346,13 +435,12 @@ async def report(inter: discord.Interaction):
     if not tally_open():
         await inter.response.send_message("The tally isn't open yet — mods open it at the deadline. Hold your numbers until then!", ephemeral=True)
         return
-    pending = db.execute("SELECT COUNT(*) AS c FROM submissions WHERE user_id=? AND reported_at IS NULL", (inter.user.id,)).fetchone()["c"]
+    pending = len(db.execute(PENDING_SQL, (inter.user.id,)).fetchall())
     if not pending:
-        await inter.response.send_message("All your submissions have final numbers. You're done — leaderboard shows the rest. 🦈", ephemeral=True)
+        await inter.response.send_message("Nothing to report — all your tweets were tracked automatically. You're done. 🦈", ephemeral=True)
         return
     await inter.response.send_message(
-        f"{pending} tweet{'s' if pending != 1 else ''} to finish. Likes and replies are already tracked automatically — "
-        f"you only enter **views** and **RTs+quotes** for each tweet (from the tweet page or your analytics).",
+        f"{pending} tweet{'s' if pending != 1 else ''} couldn't be read automatically — enter the numbers from the tweet page.",
         view=ReportPicker(inter.user.id), ephemeral=True)
 
 
@@ -377,8 +465,8 @@ def leaderboard_embed(final=False):
         colour=GOLD if final else BLUE,
         description="\n".join(lines))
     if not final:
-        e.set_footer(text=f"Season {SEASON_START} → {SEASON_END} · likes+replies tracked automatically daily · "
-                          "views+RTs added at the deadline · ✅ = mod-verified")
+        e.set_footer(text=f"Season {SEASON_START} → {SEASON_END} · all metrics tracked automatically daily · "
+                          "final snapshot at the deadline · ✅ = mod-verified")
     return e
 
 
@@ -396,10 +484,9 @@ async def tally(inter: discord.Interaction, state: app_commands.Choice[str]):
     if state.value == "open":
         ok, failed = await fetch_all_metrics()
         if ch:
-            await ch.send("📊 **The tally is OPEN!** The season is over. Likes and replies for all "
-                          f"{ok} tweets were just snapshotted automatically. To finish, run `/report` and enter just "
-                          "**views** and **RTs+quotes** for each of your tweets. Mods verify the top entries before prizes."
-                          + (f"\n⚠️ {failed} tweet(s) couldn't be fetched (deleted/restricted) — mods will review those." if failed else ""))
+            await ch.send(f"📊 **The tally is OPEN!** Final metrics for {ok} tweets were snapshotted automatically — "
+                          "views, likes, replies, and RTs+quotes. Nothing to do for most creators; mods verify the top entries before prizes."
+                          + (f"\n⚠️ {failed} tweet(s) couldn't be read (deleted/restricted) — those creators should run `/report`." if failed else ""))
     elif ch:
         await ch.send("The tally window is closed.")
 
@@ -444,7 +531,9 @@ async def post_leaderboard(inter: discord.Interaction):
 @tree.command(name="finalize", description="Mod: lock the season and post final results", guild=guild_obj)
 @app_commands.check(mod_check)
 async def finalize(inter: discord.Interaction):
-    unreported = db.execute("SELECT COUNT(*) AS c FROM submissions WHERE reported_at IS NULL").fetchone()["c"]
+    unreported = db.execute(
+        "SELECT COUNT(*) AS c FROM submissions WHERE reported_at IS NULL AND "
+        "(fetch_error IS NOT NULL OR views IS NULL OR likes IS NULL OR replies IS NULL OR rtq IS NULL)").fetchone()["c"]
     unverified_top = [r for r in leaderboard_rows()[:5] if r["reported"] and r["verified"] < r["reported"]]
     warnings = []
     if unreported:

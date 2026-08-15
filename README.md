@@ -9,19 +9,24 @@ posts the leaderboard — replacing the manual tally.
 
 | Metric | Points | How it's collected |
 |---|---|---|
-| Views | 1 pt per full 500 | creator enters once at the deadline |
-| Like | 0.5 pt | **automatic** (daily, via X's public embed endpoint) |
+| Views | 1 pt per full 500 | **automatic** (daily) |
+| Like | 0.5 pt | **automatic** (daily) |
 | Reply | 2 pts | **automatic** (daily) |
-| RT / Quote | 2 pts | creator enters once at the deadline |
+| RT / Quote | 2 pts | **automatic** (daily) |
 | LeSharX PFP | +20 pts per week | mod-awarded weekly |
 
-Likes and replies are fetched automatically every day at 17:00 UTC for every
-submitted tweet (no X account or API key needed), so the leaderboard is live all
-season. Views and RT/quote counts aren't exposed by the free endpoint — creators
-add just those two numbers per tweet when the tally opens, and mods verify the
-top 5. When `/tally open` runs, the bot takes a final likes/replies snapshot and
-freezes it (the "read once at the deadline" rule). If a tweet is deleted
-mid-season it keeps its last fetched numbers and gets flagged for mod review.
+All four engagement metrics are fetched automatically every day at 17:00 UTC for
+every submitted tweet — no X account or API key needed — so the leaderboard is
+live all season and creators never report numbers. Sources, in fallback order:
+fxtwitter → vxtwitter → X's syndication endpoint (the same public services that
+power tweet embeds; the bot never scrapes x.com itself). `/submit` also checks
+the rules live: the tweet must exist, contain a visual, and tag @LeSharXverse —
+non-compliant tweets are rejected on the spot with the reason.
+
+When `/tally open` runs, the bot takes one final snapshot and freezes it (the
+"read once at the deadline" rule). `/report` exists only as a manual fallback
+for tweets the endpoints couldn't read (deleted/restricted, or all sources
+down); the bot alerts mods if the daily fetch failure rate exceeds 20%.
 
 ## Commands
 
