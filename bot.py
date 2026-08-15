@@ -14,9 +14,12 @@ import os
 import re
 import csv
 import io
+import math
+import asyncio
 import sqlite3
 import datetime as dt
 
+import aiohttp
 import discord
 from discord import app_commands
 from discord.ext import tasks
@@ -66,6 +69,12 @@ CREATE TABLE IF NOT EXISTS meta (
 );
 """)
 db.commit()
+for _col in ("auto_fetched_at TEXT", "fetch_error TEXT"):
+    try:
+        db.execute(f"ALTER TABLE submissions ADD COLUMN {_col}")
+        db.commit()
+    except sqlite3.OperationalError:
+        pass
 
 
 def meta_get(key, default=""):
@@ -97,11 +106,11 @@ def current_week():
 
 
 def tweet_points(views, likes, replies, rtq):
-    return (views // 500) * 1.0 + likes * 0.5 + replies * 2.0 + rtq * 2.0
+    return ((views or 0) // 500) * 1.0 + (likes or 0) * 0.5 + (replies or 0) * 2.0 + (rtq or 0) * 2.0
 
 
 def user_points(user_id):
-    rows = db.execute("SELECT views, likes, replies, rtq FROM submissions WHERE user_id=? AND reported_at IS NOT NULL", (user_id,)).fetchall()
+    rows = db.execute("SELECT views, likes, replies, rtq FROM submissions WHERE user_id=?", (user_id,)).fetchall()
     pts = sum(tweet_points(r["views"], r["likes"], r["replies"], r["rtq"]) for r in rows)
     pfp_weeks = db.execute("SELECT COUNT(*) AS c FROM pfp_awards WHERE user_id=?", (user_id,)).fetchone()["c"]
     return pts + pfp_weeks * PFP_WEEKLY_PTS, pfp_weeks
@@ -123,6 +132,66 @@ def leaderboard_rows():
 
 def fmt_pts(p):
     return f"{p:g}" if p == int(p) else f"{p:.1f}"
+
+
+# ---------- automatic metrics (X embed/syndication endpoint) ----------
+# Returns likes + replies for any public tweet without auth. Views and
+# RT/quote counts are NOT exposed here; those stay creator-reported at
+# the deadline (or move to the paid X API later).
+
+def _syn_token(tweet_id):
+    n = (int(tweet_id) / 1e15) * math.pi
+    digits = "0123456789abcdefghijklmnopqrstuvwxyz"
+    ip, frac = int(n), n - int(n)
+    a = ""
+    while ip:
+        a = digits[ip % 36] + a
+        ip //= 36
+    f = ""
+    for _ in range(12):
+        frac *= 36
+        d = int(frac)
+        f += digits[d]
+        frac -= d
+    return (a + f).replace("0", "").replace(".", "")
+
+
+async def fetch_tweet_metrics(session, tweet_id):
+    url = f"https://cdn.syndication.twimg.com/tweet-result?id={tweet_id}&token={_syn_token(tweet_id)}"
+    async with session.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+        if resp.status != 200:
+            return None, f"http {resp.status}"
+        data = await resp.json()
+        if data.get("__typename") == "TweetTombstone":
+            return None, "deleted or restricted"
+        likes = data.get("favorite_count")
+        replies = data.get("conversation_count")
+        if likes is None and replies is None:
+            return None, "no metrics in response"
+        return {"likes": int(likes or 0), "replies": int(replies or 0)}, None
+
+
+async def fetch_all_metrics():
+    """Refresh likes/replies for every submission. Returns (ok, failed)."""
+    rows = db.execute("SELECT id, tweet_id FROM submissions").fetchall()
+    ok = failed = 0
+    now = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+    async with aiohttp.ClientSession() as session:
+        for r in rows:
+            try:
+                metrics, err = await fetch_tweet_metrics(session, r["tweet_id"])
+            except Exception as e:
+                metrics, err = None, str(e)[:80]
+            if metrics:
+                db.execute("UPDATE submissions SET likes=?, replies=?, auto_fetched_at=?, fetch_error=NULL WHERE id=?",
+                           (metrics["likes"], metrics["replies"], now, r["id"]))
+                ok += 1
+            else:
+                db.execute("UPDATE submissions SET fetch_error=? WHERE id=?", (err, r["id"]))
+                failed += 1
+            db.commit()
+            await asyncio.sleep(1.2)
+    return ok, failed
 
 
 # ---------- bot ----------
@@ -210,11 +279,13 @@ async def mytweets(inter: discord.Interaction):
     pts, pfp_weeks = user_points(inter.user.id)
     lines = []
     for r in rows[-12:]:
+        p = tweet_points(r["views"], r["likes"], r["replies"], r["rtq"])
         if r["reported_at"]:
-            p = tweet_points(r["views"], r["likes"], r["replies"], r["rtq"])
-            state = f"{fmt_pts(p)} pts" + (" ✅" if r["verified"] else "")
+            state = f"{fmt_pts(p)} pts (final)" + (" ✅" if r["verified"] else "")
+        elif tally_open():
+            state = f"{fmt_pts(p)} pts — add views/RTs with `/report`"
         else:
-            state = "awaiting metrics" if tally_open() else "—"
+            state = f"{fmt_pts(p)} pts (live)"
         lines.append(f"`{r['day']}` <{r['url']}> · {state}")
     e = discord.Embed(title="Your season", colour=BLUE, description="\n".join(lines))
     e.add_field(name="Total points", value=fmt_pts(pts))
@@ -224,29 +295,33 @@ async def mytweets(inter: discord.Interaction):
 
 
 class MetricsModal(discord.ui.Modal):
+    """Likes and replies are auto-fetched; creators only add the two
+    numbers the free endpoint can't see: views and RTs+quotes."""
+
     def __init__(self, sub_id, url):
-        super().__init__(title="Tweet metrics (from your X analytics)")
+        super().__init__(title="Final numbers (views + RTs/quotes)")
         self.sub_id = sub_id
         self.views = discord.ui.TextInput(label="Views", placeholder="e.g. 3400")
-        self.likes = discord.ui.TextInput(label="Likes", placeholder="e.g. 42")
-        self.replies = discord.ui.TextInput(label="Replies", placeholder="e.g. 7")
         self.rtq = discord.ui.TextInput(label="Retweets + Quotes", placeholder="e.g. 11")
-        for item in (self.views, self.likes, self.replies, self.rtq):
-            self.add_item(item)
+        self.add_item(self.views)
+        self.add_item(self.rtq)
 
     async def on_submit(self, inter: discord.Interaction):
         try:
-            vals = [int(str(x.value).replace(",", "").strip()) for x in (self.views, self.likes, self.replies, self.rtq)]
+            vals = [int(str(x.value).replace(",", "").strip()) for x in (self.views, self.rtq)]
             if any(v < 0 for v in vals):
                 raise ValueError
         except ValueError:
             await inter.response.send_message("Numbers only, please — try `/report` again.", ephemeral=True)
             return
-        db.execute("UPDATE submissions SET views=?, likes=?, replies=?, rtq=?, reported_at=?, verified=0 WHERE id=?",
+        db.execute("UPDATE submissions SET views=?, rtq=?, reported_at=?, verified=0 WHERE id=?",
                    (*vals, dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"), self.sub_id))
         db.commit()
-        p = tweet_points(*vals)
-        await inter.response.send_message(f"Recorded: **{fmt_pts(p)} points** for that tweet. Run `/report` again for your next one.", ephemeral=True)
+        row = db.execute("SELECT views, likes, replies, rtq FROM submissions WHERE id=?", (self.sub_id,)).fetchone()
+        p = tweet_points(row["views"], row["likes"], row["replies"], row["rtq"])
+        await inter.response.send_message(
+            f"Recorded — that tweet now scores **{fmt_pts(p)} points** (likes and replies were tracked automatically). "
+            f"Run `/report` again for your next one.", ephemeral=True)
 
 
 class ReportPicker(discord.ui.View):
@@ -273,10 +348,11 @@ async def report(inter: discord.Interaction):
         return
     pending = db.execute("SELECT COUNT(*) AS c FROM submissions WHERE user_id=? AND reported_at IS NULL", (inter.user.id,)).fetchone()["c"]
     if not pending:
-        await inter.response.send_message("All your submissions have metrics. You're done — leaderboard shows the rest. 🦈", ephemeral=True)
+        await inter.response.send_message("All your submissions have final numbers. You're done — leaderboard shows the rest. 🦈", ephemeral=True)
         return
     await inter.response.send_message(
-        f"{pending} tweet{'s' if pending != 1 else ''} awaiting metrics. Open each tweet's analytics on X and copy the numbers as of now.",
+        f"{pending} tweet{'s' if pending != 1 else ''} to finish. Likes and replies are already tracked automatically — "
+        f"you only enter **views** and **RTs+quotes** for each tweet (from the tweet page or your analytics).",
         view=ReportPicker(inter.user.id), ephemeral=True)
 
 
@@ -301,7 +377,8 @@ def leaderboard_embed(final=False):
         colour=GOLD if final else BLUE,
         description="\n".join(lines))
     if not final:
-        e.set_footer(text=f"Season {SEASON_START} → {SEASON_END} · metrics snapshot at deadline · ✅ = mod-verified")
+        e.set_footer(text=f"Season {SEASON_START} → {SEASON_END} · likes+replies tracked automatically daily · "
+                          "views+RTs added at the deadline · ✅ = mod-verified")
     return e
 
 
@@ -313,16 +390,18 @@ def leaderboard_embed(final=False):
 @app_commands.check(mod_check)
 async def tally(inter: discord.Interaction, state: app_commands.Choice[str]):
     meta_set("tally", state.value)
-    if state.value == "open":
-        msg = ("📊 **The tally is OPEN!** The season is over — open each of your submitted tweets' analytics on X and "
-               "run `/report` here to enter views, likes, replies, and RTs+quotes for every tweet. "
-               "Mods will verify the top entries before prizes.")
-    else:
-        msg = "The tally window is closed."
-    await inter.response.send_message(f"Tally is now **{state.value}**.", ephemeral=True)
+    await inter.response.send_message(f"Tally is now **{state.value}**." +
+        (" Taking the final likes/replies snapshot…" if state.value == "open" else ""), ephemeral=True)
     ch = client.get_channel(ANNOUNCE_CHANNEL_ID or SUBMIT_CHANNEL_ID)
-    if ch:
-        await ch.send(msg)
+    if state.value == "open":
+        ok, failed = await fetch_all_metrics()
+        if ch:
+            await ch.send("📊 **The tally is OPEN!** The season is over. Likes and replies for all "
+                          f"{ok} tweets were just snapshotted automatically. To finish, run `/report` and enter just "
+                          "**views** and **RTs+quotes** for each of your tweets. Mods verify the top entries before prizes."
+                          + (f"\n⚠️ {failed} tweet(s) couldn't be fetched (deleted/restricted) — mods will review those." if failed else ""))
+    elif ch:
+        await ch.send("The tally window is closed.")
 
 
 @tree.command(name="pfp_award", description="Mod: award this week's +20 PFP bonus to a member", guild=guild_obj)
@@ -385,6 +464,18 @@ async def finalize(inter: discord.Interaction):
     await inter.response.send_message("Season finalized and results posted.", ephemeral=True)
 
 
+@tree.command(name="fetch", description="Mod: refresh likes/replies for all submissions now", guild=guild_obj)
+@app_commands.check(mod_check)
+async def fetch_now(inter: discord.Interaction):
+    await inter.response.defer(ephemeral=True)
+    ok, failed = await fetch_all_metrics()
+    msg = f"Refreshed {ok} tweet(s)."
+    if failed:
+        bad = db.execute("SELECT url, fetch_error FROM submissions WHERE fetch_error IS NOT NULL LIMIT 10").fetchall()
+        msg += f" {failed} failed:\n" + "\n".join(f"• <{b['url']}> — {b['fetch_error']}" for b in bad)
+    await inter.followup.send(msg, ephemeral=True)
+
+
 @tree.command(name="export", description="Mod: export all season data as CSV", guild=guild_obj)
 @app_commands.check(mod_check)
 async def export(inter: discord.Interaction):
@@ -412,7 +503,21 @@ async def on_app_error(inter: discord.Interaction, error):
         raise error
 
 
-# ---------- scheduled reminder ----------
+# ---------- scheduled jobs ----------
+
+@tasks.loop(time=dt.time(hour=17, minute=0, tzinfo=dt.timezone.utc))
+async def daily_fetch():
+    """Daily auto-refresh of likes/replies (frozen once the tally opens)."""
+    if not season_active() or tally_open():
+        return
+    ok, failed = await fetch_all_metrics()
+    total = ok + failed
+    if total and failed / total > 0.2:
+        ch = client.get_channel(ANNOUNCE_CHANNEL_ID or SUBMIT_CHANNEL_ID)
+        if ch:
+            await ch.send(f"⚠️ Mods: the automatic metrics check failed for {failed}/{total} tweets — "
+                          "the endpoint may have changed. `/fetch` to retry, or fall back to manual reporting.")
+
 
 @tasks.loop(time=dt.time(hour=18, minute=0, tzinfo=dt.timezone.utc))
 async def daily_reminder():
@@ -433,6 +538,8 @@ async def on_ready():
     await tree.sync(guild=guild_obj)
     if not daily_reminder.is_running():
         daily_reminder.start()
+    if not daily_fetch.is_running():
+        daily_fetch.start()
     print(f"Logged in as {client.user} · season {SEASON_START} → {SEASON_END}")
 
 

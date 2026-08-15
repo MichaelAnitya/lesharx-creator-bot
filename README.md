@@ -7,13 +7,21 @@ posts the leaderboard — replacing the manual tally.
 
 ## Scoring (as announced in Season 1)
 
-| Metric | Points |
-|---|---|
-| Views | 1 pt per full 500 |
-| Like | 0.5 pt |
-| Reply | 2 pts |
-| RT / Quote | 2 pts |
-| LeSharX PFP | +20 pts per week (mod-awarded) |
+| Metric | Points | How it's collected |
+|---|---|---|
+| Views | 1 pt per full 500 | creator enters once at the deadline |
+| Like | 0.5 pt | **automatic** (daily, via X's public embed endpoint) |
+| Reply | 2 pts | **automatic** (daily) |
+| RT / Quote | 2 pts | creator enters once at the deadline |
+| LeSharX PFP | +20 pts per week | mod-awarded weekly |
+
+Likes and replies are fetched automatically every day at 17:00 UTC for every
+submitted tweet (no X account or API key needed), so the leaderboard is live all
+season. Views and RT/quote counts aren't exposed by the free endpoint — creators
+add just those two numbers per tweet when the tally opens, and mods verify the
+top 5. When `/tally open` runs, the bot takes a final likes/replies snapshot and
+freezes it (the "read once at the deadline" rule). If a tweet is deleted
+mid-season it keeps its last fetched numbers and gets flagged for mod review.
 
 ## Commands
 
