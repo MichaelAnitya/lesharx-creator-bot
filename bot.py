@@ -724,6 +724,29 @@ class NewSeasonConfirm(discord.ui.View):
         await inter.response.edit_message(content="Cancelled — nothing changed.", view=self)
 
 
+@tree.command(name="season_extend", description="Mod: move the current season's end date (extend or end early)", guild=guild_obj)
+@app_commands.describe(end="New last day, YYYY-MM-DD (inclusive — submissions close at midnight UTC after it)")
+@app_commands.check(mod_check)
+async def season_extend(inter: discord.Interaction, end: str):
+    try:
+        new_end = dt.date.fromisoformat(end)
+        if new_end <= season_start():
+            raise ValueError
+    except ValueError:
+        await inter.response.send_message("Date must be YYYY-MM-DD and after the season start.", ephemeral=True)
+        return
+    old_end = season_end()
+    meta_set("season_end", end)
+    extended = new_end > old_end
+    await inter.response.send_message(
+        f"Season {cur_season()} end date: {old_end} → **{new_end}**"
+        + ("" if extended else " (season shortened — submissions close after that day)"), ephemeral=True)
+    ch = client.get_channel(ANNOUNCE_CHANNEL_ID or SUBMIT_CHANNEL_ID)
+    if ch and extended:
+        await ch.send(f"# 📅 DEADLINE EXTENDED\nThe Creator Rewards season now runs until **{new_end}** — "
+                      f"more days, more posts, more points. Keep that LeSharX PFP on. LFJAWS 🦈")
+
+
 @tree.command(name="season_new", description="Mod: archive (or discard) the current season and start a new one", guild=guild_obj)
 @app_commands.describe(
     start="New season's first day, YYYY-MM-DD",
