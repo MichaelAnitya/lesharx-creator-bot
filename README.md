@@ -40,6 +40,7 @@ The bot alerts mods if the daily fetch failure rate exceeds 20%.
 - `/leaderboard` — current standings (private view)
 
 **Mods** (role-gated)
+- `/creator_list` — the weekly PFP checklist: every creator with their current X avatar shown inline, profile + latest-post links, this week's bonus status, and a one-click "+20" award button each
 - `/tally open|close` — take the final metrics snapshot at the deadline; unreadable tweets are flagged, score 0, and go to review
 - `/review` — list flagged tweets with last-known numbers
 - `/award <link> <views> <likes> <replies> <rt_quotes>` — manually set a reviewed tweet's metrics (points flow through the normal formula; marked verified). For deleted-but-legit tweets, use the last-known numbers from `/review`.

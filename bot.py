@@ -69,7 +69,7 @@ CREATE TABLE IF NOT EXISTS meta (
 );
 """)
 db.commit()
-for _col in ("auto_fetched_at TEXT", "fetch_error TEXT", "author_handle TEXT", "has_media INTEGER", "mention_ok INTEGER", "needs_review INTEGER DEFAULT 0"):
+for _col in ("auto_fetched_at TEXT", "fetch_error TEXT", "author_handle TEXT", "has_media INTEGER", "mention_ok INTEGER", "needs_review INTEGER DEFAULT 0", "author_avatar TEXT"):
     try:
         db.execute(f"ALTER TABLE submissions ADD COLUMN {_col}")
         db.commit()
@@ -186,6 +186,7 @@ async def fetch_tweet_metrics(session, tweet_id):
             "replies": t.get("replies") or 0,
             "rtq": (t.get("retweets") or 0) + (t.get("quotes") or 0),
             "author": (t.get("author") or {}).get("screen_name"),
+            "avatar": (t.get("author") or {}).get("avatar_url"),
             "has_media": 1 if t.get("media") else 0,
             "mention_ok": 1 if "@lesharxverse" in text else 0,
         }, None
@@ -201,6 +202,7 @@ async def fetch_tweet_metrics(session, tweet_id):
             "replies": data.get("replies") or 0,
             "rtq": data.get("retweets") or 0,
             "author": data.get("user_screen_name"),
+            "avatar": data.get("user_profile_image_url"),
             "has_media": 1 if data.get("mediaURLs") else 0,
             "mention_ok": 1 if "@lesharxverse" in text else 0,
         }, None
@@ -217,6 +219,7 @@ async def fetch_tweet_metrics(session, tweet_id):
                 "replies": int(data.get("conversation_count") or 0),
                 "rtq": None,
                 "author": ((data.get("user") or {}).get("screen_name")),
+                "avatar": ((data.get("user") or {}).get("profile_image_url_https")),
                 "has_media": 1 if data.get("mediaDetails") else None,
                 "mention_ok": None,
             }, None
@@ -239,10 +242,11 @@ async def fetch_all_metrics():
                                 views=COALESCE(?, views), likes=COALESCE(?, likes),
                                 replies=COALESCE(?, replies), rtq=COALESCE(?, rtq),
                                 author_handle=COALESCE(?, author_handle),
+                                author_avatar=COALESCE(?, author_avatar),
                                 has_media=COALESCE(?, has_media), mention_ok=COALESCE(?, mention_ok),
                                 auto_fetched_at=?, fetch_error=NULL WHERE id=?""",
                            (metrics["views"], metrics["likes"], metrics["replies"], metrics["rtq"],
-                            metrics["author"], metrics["has_media"], metrics["mention_ok"], now, r["id"]))
+                            metrics["author"], metrics["avatar"], metrics["has_media"], metrics["mention_ok"], now, r["id"]))
                 ok += 1
             else:
                 db.execute("UPDATE submissions SET fetch_error=? WHERE id=?", (err, r["id"]))
@@ -320,9 +324,9 @@ async def submit(inter: discord.Interaction, link: str):
                (inter.user.id, str(inter.user), canonical, tweet_id, day, now))
     if metrics:
         db.execute("""UPDATE submissions SET views=?, likes=?, replies=?, rtq=?, author_handle=?,
-                      has_media=?, mention_ok=?, auto_fetched_at=? WHERE tweet_id=?""",
+                      author_avatar=?, has_media=?, mention_ok=?, auto_fetched_at=? WHERE tweet_id=?""",
                    (metrics["views"], metrics["likes"], metrics["replies"], metrics["rtq"],
-                    metrics["author"], metrics["has_media"], metrics["mention_ok"], now, tweet_id))
+                    metrics["author"], metrics["avatar"], metrics["has_media"], metrics["mention_ok"], now, tweet_id))
     else:
         db.execute("UPDATE submissions SET fetch_error=? WHERE tweet_id=?", (err, tweet_id))
     db.commit()
@@ -435,6 +439,62 @@ async def tally(inter: discord.Interaction, state: app_commands.Choice[str]):
             await inter.followup.send(f"{flagged} tweet(s) flagged for review — run `/review` to see them, then `/award` to restore points.", ephemeral=True)
     elif ch:
         await ch.send("The tally window is closed.")
+
+
+class PFPButton(discord.ui.Button):
+    def __init__(self, user_id, name, awarded):
+        super().__init__(
+            label=(f"✅ {name}" if awarded else f"+20 · {name}")[:80],
+            style=discord.ButtonStyle.success if not awarded else discord.ButtonStyle.secondary,
+            disabled=awarded)
+        self.target_id = user_id
+        self.target_name = name
+
+    async def callback(self, inter: discord.Interaction):
+        try:
+            db.execute("INSERT INTO pfp_awards (user_id, week) VALUES (?, ?)", (self.target_id, current_week()))
+            db.commit()
+        except sqlite3.IntegrityError:
+            pass
+        self.label = f"✅ {self.target_name}"[:80]
+        self.style = discord.ButtonStyle.secondary
+        self.disabled = True
+        await inter.response.edit_message(view=self.view)
+
+
+@tree.command(name="creator_list", description="Mod: weekly PFP checklist — avatars + one-click awards", guild=guild_obj)
+@app_commands.check(mod_check)
+async def creator_list(inter: discord.Interaction):
+    await inter.response.defer(ephemeral=True)
+    users = db.execute("SELECT DISTINCT user_id, user_name FROM submissions ORDER BY user_name").fetchall()
+    if not users:
+        await inter.followup.send("No creators yet this season.", ephemeral=True)
+        return
+    week = current_week()
+    entries = []
+    for u in users:
+        latest = db.execute("SELECT * FROM submissions WHERE user_id=? ORDER BY created_at DESC LIMIT 1", (u["user_id"],)).fetchone()
+        awarded = db.execute("SELECT 1 FROM pfp_awards WHERE user_id=? AND week=?", (u["user_id"], week)).fetchone() is not None
+        entries.append((u, latest, awarded))
+    await inter.followup.send(
+        f"**Week {week + 1} PFP checklist** — {len(entries)} creator(s). Avatars refresh with the daily fetch; "
+        "eyeball each one and click to award. Profile links are ground truth for disputes.", ephemeral=True)
+    for i in range(0, len(entries), 5):
+        chunk = entries[i:i + 5]
+        embeds, view = [], discord.ui.View(timeout=900)
+        for u, latest, awarded in chunk:
+            e = discord.Embed(colour=BLUE, title=u["user_name"])
+            desc = []
+            if latest["author_handle"]:
+                desc.append(f"[@{latest['author_handle']}](https://x.com/{latest['author_handle']}) on X")
+            desc.append(f"[latest post]({latest['url']}) · {latest['day']}")
+            desc.append("PFP bonus: " + ("✅ awarded this week" if awarded else "⬜ pending"))
+            e.description = "\n".join(desc)
+            if latest["author_avatar"]:
+                e.set_thumbnail(url=latest["author_avatar"])
+            embeds.append(e)
+            view.add_item(PFPButton(u["user_id"], u["user_name"].split("#")[0], awarded))
+        await inter.followup.send(embeds=embeds, view=view, ephemeral=True)
 
 
 @tree.command(name="pfp_award", description="Mod: award this week's +20 PFP bonus to a member", guild=guild_obj)
