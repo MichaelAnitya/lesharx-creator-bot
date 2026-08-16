@@ -49,7 +49,11 @@ The bot alerts mods if the daily fetch failure rate exceeds 20%.
 - `/verify @member` — mark a member's reported numbers as checked (do this for the top 5 before finalizing)
 - `/post_leaderboard` — post standings publicly
 - `/finalize` — lock the season and post final results (warns if metrics are missing or top-5 unverified)
-- `/export` — full-season CSV for auditing
+- `/export [season]` — CSV audit dump for the current or any archived season
+- `/season_new start end [discard]` — start the next season (confirm-button gated). Default **archives** the
+  finished season forever; `discard: true` permanently deletes the current season's data instead — use that
+  to wipe test runs before a real launch. Season dates are set here, in Discord; the env vars only seed the
+  first season.
 
 It also posts an automatic reminder every 3rd day at 18:00 UTC, and a last-day alert.
 
