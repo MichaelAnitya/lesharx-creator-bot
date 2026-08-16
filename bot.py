@@ -381,38 +381,41 @@ async def mytweets(inter: discord.Interaction):
 
 class MetricsModal(discord.ui.Modal):
     """Manual fallback only — used when the auto-fetch couldn't read a tweet.
-    Prefilled with whatever the bot already knows."""
+    Exposes ONLY the fields the bot is missing: auto-fetched numbers are
+    locked and can never be edited by the creator."""
+
+    FIELDS = [("views", "Views"), ("likes", "Likes"), ("replies", "Replies"), ("rtq", "Retweets + Quotes")]
 
     def __init__(self, sub_id, row):
-        super().__init__(title="Enter this tweet's numbers")
+        super().__init__(title="Enter this tweet's missing numbers")
         self.sub_id = sub_id
-        def field(label, val):
-            return discord.ui.TextInput(label=label, default="" if val is None else str(val), placeholder="0")
-        self.views = field("Views", row["views"])
-        self.likes = field("Likes", row["likes"])
-        self.replies = field("Replies", row["replies"])
-        self.rtq = field("Retweets + Quotes", row["rtq"])
-        for item in (self.views, self.likes, self.replies, self.rtq):
-            self.add_item(item)
+        self.inputs = {}
+        for col, label in self.FIELDS:
+            if row[col] is None:
+                inp = discord.ui.TextInput(label=label, placeholder="0")
+                self.inputs[col] = inp
+                self.add_item(inp)
 
     async def on_submit(self, inter: discord.Interaction):
         try:
-            vals = [int(str(x.value).replace(",", "").strip() or 0) for x in (self.views, self.likes, self.replies, self.rtq)]
-            if any(v < 0 for v in vals):
+            vals = {col: int(str(inp.value).replace(",", "").strip() or 0) for col, inp in self.inputs.items()}
+            if any(v < 0 for v in vals.values()):
                 raise ValueError
         except ValueError:
             await inter.response.send_message("Numbers only, please — try `/report` again.", ephemeral=True)
             return
-        db.execute("UPDATE submissions SET views=?, likes=?, replies=?, rtq=?, reported_at=?, verified=0 WHERE id=?",
-                   (*vals, dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"), self.sub_id))
+        sets = ", ".join(f"{col}=?" for col in vals) + ", reported_at=?, verified=0"
+        db.execute(f"UPDATE submissions SET {sets} WHERE id=? AND reported_at IS NULL",
+                   (*vals.values(), dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"), self.sub_id))
         db.commit()
-        p = tweet_points(*vals)
+        row = db.execute("SELECT views, likes, replies, rtq FROM submissions WHERE id=?", (self.sub_id,)).fetchone()
+        p = tweet_points(row["views"], row["likes"], row["replies"], row["rtq"])
         await inter.response.send_message(
             f"Recorded — that tweet scores **{fmt_pts(p)} points**. Run `/report` again if more are flagged.", ephemeral=True)
 
 
 PENDING_SQL = ("SELECT * FROM submissions WHERE user_id=? AND reported_at IS NULL AND "
-               "(fetch_error IS NOT NULL OR views IS NULL OR likes IS NULL OR replies IS NULL OR rtq IS NULL)")
+               "(views IS NULL OR likes IS NULL OR replies IS NULL OR rtq IS NULL)")
 
 
 class ReportPicker(discord.ui.View):
@@ -533,7 +536,7 @@ async def post_leaderboard(inter: discord.Interaction):
 async def finalize(inter: discord.Interaction):
     unreported = db.execute(
         "SELECT COUNT(*) AS c FROM submissions WHERE reported_at IS NULL AND "
-        "(fetch_error IS NOT NULL OR views IS NULL OR likes IS NULL OR replies IS NULL OR rtq IS NULL)").fetchone()["c"]
+        "(views IS NULL OR likes IS NULL OR replies IS NULL OR rtq IS NULL)").fetchone()["c"]
     unverified_top = [r for r in leaderboard_rows()[:5] if r["reported"] and r["verified"] < r["reported"]]
     warnings = []
     if unreported:
