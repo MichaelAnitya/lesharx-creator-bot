@@ -69,7 +69,7 @@ CREATE TABLE IF NOT EXISTS meta (
 );
 """)
 db.commit()
-for _col in ("auto_fetched_at TEXT", "fetch_error TEXT", "author_handle TEXT", "has_media INTEGER", "mention_ok INTEGER"):
+for _col in ("auto_fetched_at TEXT", "fetch_error TEXT", "author_handle TEXT", "has_media INTEGER", "mention_ok INTEGER", "needs_review INTEGER DEFAULT 0"):
     try:
         db.execute(f"ALTER TABLE submissions ADD COLUMN {_col}")
         db.commit()
@@ -110,7 +110,7 @@ def tweet_points(views, likes, replies, rtq):
 
 
 def user_points(user_id):
-    rows = db.execute("SELECT views, likes, replies, rtq FROM submissions WHERE user_id=?", (user_id,)).fetchall()
+    rows = db.execute("SELECT views, likes, replies, rtq FROM submissions WHERE user_id=? AND needs_review=0", (user_id,)).fetchall()
     pts = sum(tweet_points(r["views"], r["likes"], r["replies"], r["rtq"]) for r in rows)
     pfp_weeks = db.execute("SELECT COUNT(*) AS c FROM pfp_awards WHERE user_id=?", (user_id,)).fetchone()["c"]
     return pts + pfp_weeks * PFP_WEEKLY_PTS, pfp_weeks
@@ -365,10 +365,10 @@ async def mytweets(inter: discord.Interaction):
     lines = []
     for r in rows[-12:]:
         p = tweet_points(r["views"], r["likes"], r["replies"], r["rtq"])
-        if r["verified"]:
+        if r["needs_review"]:
+            state = "0 pts — under mod review"
+        elif r["verified"]:
             state = f"{fmt_pts(p)} pts ✅"
-        elif r["fetch_error"] and tally_open():
-            state = f"{fmt_pts(p)} pts — needs `/report`"
         else:
             state = f"{fmt_pts(p)} pts" + ("" if tally_open() else " (live)")
         lines.append(f"`{r['day']}` <{r['url']}> · {state}")
@@ -379,72 +379,9 @@ async def mytweets(inter: discord.Interaction):
     await inter.response.send_message(embed=e, ephemeral=True)
 
 
-class MetricsModal(discord.ui.Modal):
-    """Manual fallback only — used when the auto-fetch couldn't read a tweet.
-    Exposes ONLY the fields the bot is missing: auto-fetched numbers are
-    locked and can never be edited by the creator."""
-
-    FIELDS = [("views", "Views"), ("likes", "Likes"), ("replies", "Replies"), ("rtq", "Retweets + Quotes")]
-
-    def __init__(self, sub_id, row):
-        super().__init__(title="Enter this tweet's missing numbers")
-        self.sub_id = sub_id
-        self.inputs = {}
-        for col, label in self.FIELDS:
-            if row[col] is None:
-                inp = discord.ui.TextInput(label=label, placeholder="0")
-                self.inputs[col] = inp
-                self.add_item(inp)
-
-    async def on_submit(self, inter: discord.Interaction):
-        try:
-            vals = {col: int(str(inp.value).replace(",", "").strip() or 0) for col, inp in self.inputs.items()}
-            if any(v < 0 for v in vals.values()):
-                raise ValueError
-        except ValueError:
-            await inter.response.send_message("Numbers only, please — try `/report` again.", ephemeral=True)
-            return
-        sets = ", ".join(f"{col}=?" for col in vals) + ", reported_at=?, verified=0"
-        db.execute(f"UPDATE submissions SET {sets} WHERE id=? AND reported_at IS NULL",
-                   (*vals.values(), dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"), self.sub_id))
-        db.commit()
-        row = db.execute("SELECT views, likes, replies, rtq FROM submissions WHERE id=?", (self.sub_id,)).fetchone()
-        p = tweet_points(row["views"], row["likes"], row["replies"], row["rtq"])
-        await inter.response.send_message(
-            f"Recorded — that tweet scores **{fmt_pts(p)} points**. Run `/report` again if more are flagged.", ephemeral=True)
 
 
-PENDING_SQL = ("SELECT * FROM submissions WHERE user_id=? AND reported_at IS NULL AND "
-               "(views IS NULL OR likes IS NULL OR replies IS NULL OR rtq IS NULL)")
-
-
-class ReportPicker(discord.ui.View):
-    def __init__(self, user_id):
-        super().__init__(timeout=300)
-        rows = db.execute(PENDING_SQL + " ORDER BY day LIMIT 25", (user_id,)).fetchall()
-        options = [discord.SelectOption(label=f"{r['day']} — …{r['url'][-24:]}", value=str(r["id"])) for r in rows]
-        self.select = discord.ui.Select(placeholder="Pick a tweet to enter metrics for", options=options)
-        self.select.callback = self.picked
-        self.add_item(self.select)
-        self.rows = {str(r["id"]): r for r in rows}
-
-    async def picked(self, inter: discord.Interaction):
-        sid = self.select.values[0]
-        await inter.response.send_modal(MetricsModal(int(sid), self.rows[sid]))
-
-
-@tree.command(name="report", description="Enter your tweets' final metrics (deadline only)", guild=guild_obj)
-async def report(inter: discord.Interaction):
-    if not tally_open():
-        await inter.response.send_message("The tally isn't open yet — mods open it at the deadline. Hold your numbers until then!", ephemeral=True)
-        return
-    pending = len(db.execute(PENDING_SQL, (inter.user.id,)).fetchall())
-    if not pending:
-        await inter.response.send_message("Nothing to report — all your tweets were tracked automatically. You're done. 🦈", ephemeral=True)
-        return
-    await inter.response.send_message(
-        f"{pending} tweet{'s' if pending != 1 else ''} couldn't be read automatically — enter the numbers from the tweet page.",
-        view=ReportPicker(inter.user.id), ephemeral=True)
+REVIEW_SQL = "SELECT * FROM submissions WHERE needs_review=1 ORDER BY user_name, day"
 
 
 @tree.command(name="leaderboard", description="Current season standings", guild=guild_obj)
@@ -486,10 +423,16 @@ async def tally(inter: discord.Interaction, state: app_commands.Choice[str]):
     ch = client.get_channel(ANNOUNCE_CHANNEL_ID or SUBMIT_CHANNEL_ID)
     if state.value == "open":
         ok, failed = await fetch_all_metrics()
+        flagged = db.execute(
+            "UPDATE submissions SET needs_review=1 WHERE verified=0 AND "
+            "(fetch_error IS NOT NULL OR views IS NULL OR likes IS NULL OR replies IS NULL OR rtq IS NULL)").rowcount
+        db.commit()
         if ch:
             await ch.send(f"📊 **The tally is OPEN!** Final metrics for {ok} tweets were snapshotted automatically — "
-                          "views, likes, replies, and RTs+quotes. Nothing to do for most creators; mods verify the top entries before prizes."
-                          + (f"\n⚠️ {failed} tweet(s) couldn't be read (deleted/restricted) — those creators should run `/report`." if failed else ""))
+                          "views, likes, replies, and RTs+quotes. Nothing left to do for creators; mods verify the top entries before prizes."
+                          + (f"\n⚠️ {flagged} tweet(s) couldn't be read and score 0 pending mod review." if flagged else ""))
+        if flagged:
+            await inter.followup.send(f"{flagged} tweet(s) flagged for review — run `/review` to see them, then `/award` to restore points.", ephemeral=True)
     elif ch:
         await ch.send("The tally window is closed.")
 
@@ -534,13 +477,11 @@ async def post_leaderboard(inter: discord.Interaction):
 @tree.command(name="finalize", description="Mod: lock the season and post final results", guild=guild_obj)
 @app_commands.check(mod_check)
 async def finalize(inter: discord.Interaction):
-    unreported = db.execute(
-        "SELECT COUNT(*) AS c FROM submissions WHERE reported_at IS NULL AND "
-        "(views IS NULL OR likes IS NULL OR replies IS NULL OR rtq IS NULL)").fetchone()["c"]
+    unreported = db.execute("SELECT COUNT(*) AS c FROM submissions WHERE needs_review=1").fetchone()["c"]
     unverified_top = [r for r in leaderboard_rows()[:5] if r["reported"] and r["verified"] < r["reported"]]
     warnings = []
     if unreported:
-        warnings.append(f"{unreported} submission(s) still have no metrics (they score 0)")
+        warnings.append(f"{unreported} submission(s) still under review (they score 0 — `/review`)")
     if unverified_top:
         warnings.append(f"top-5 members not fully verified: {', '.join(r['name'] for r in unverified_top)}")
     if warnings and meta_get("finalize_confirm") != "1":
@@ -554,6 +495,52 @@ async def finalize(inter: discord.Interaction):
     await ch.send("# LeSharX CREATOR REWARDS — FINAL RESULTS 🦈", embed=leaderboard_embed(final=True))
     await ch.send("**Winners, please open a ticket!** 🎁\n\nThe ocean rewards those who contribute. LFJAWS 🦈")
     await inter.response.send_message("Season finalized and results posted.", ephemeral=True)
+
+
+@tree.command(name="review", description="Mod: list tweets that need manual review", guild=guild_obj)
+@app_commands.check(mod_check)
+async def review(inter: discord.Interaction):
+    rows = db.execute(REVIEW_SQL).fetchall()
+    if not rows:
+        await inter.response.send_message("Nothing needs review. 🦈", ephemeral=True)
+        return
+    lines = []
+    for r in rows[:20]:
+        known = f"last known: {r['views'] or 0} views / {r['likes'] or 0} likes / {r['replies'] or 0} replies / {r['rtq'] or 0} RTs" \
+            if r["auto_fetched_at"] else "never fetched"
+        when = f" (fetched {r['auto_fetched_at'][:10]})" if r["auto_fetched_at"] else ""
+        lines.append(f"• <@{r['user_id']}> <{r['url']}>\n  ↳ {r['fetch_error'] or 'missing metrics'} · {known}{when}")
+    msg = ("**Tweets under review** — these score 0 until you `/award` them. Check each link "
+           "manually; if it's legit, `/award` its real numbers (or the last-known ones below). "
+           "If it's deleted, leaving it at 0 = forfeited.\n\n" + "\n".join(lines))
+    await inter.response.send_message(msg[:1990], ephemeral=True)
+
+
+@tree.command(name="award", description="Mod: manually set a reviewed tweet's metrics", guild=guild_obj)
+@app_commands.describe(link="The flagged tweet's link", views="Views", likes="Likes", replies="Replies", rt_quotes="Retweets + quotes")
+@app_commands.check(mod_check)
+async def award(inter: discord.Interaction, link: str, views: int, likes: int, replies: int, rt_quotes: int):
+    m = TWEET_RE.match(link.strip())
+    if not m:
+        await inter.response.send_message("That doesn't look like a tweet link.", ephemeral=True)
+        return
+    if min(views, likes, replies, rt_quotes) < 0:
+        await inter.response.send_message("Metrics can't be negative.", ephemeral=True)
+        return
+    row = db.execute("SELECT * FROM submissions WHERE tweet_id=?", (m.group(2),)).fetchone()
+    if not row:
+        await inter.response.send_message("No submission with that link.", ephemeral=True)
+        return
+    db.execute("""UPDATE submissions SET views=?, likes=?, replies=?, rtq=?, needs_review=0, verified=1,
+                  reported_at=?, fetch_error=NULL WHERE id=?""",
+               (views, likes, replies, rt_quotes,
+                dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"), row["id"]))
+    db.commit()
+    p = tweet_points(views, likes, replies, rt_quotes)
+    left = db.execute("SELECT COUNT(*) AS c FROM submissions WHERE needs_review=1").fetchone()["c"]
+    await inter.response.send_message(
+        f"Awarded: <@{row['user_id']}>'s tweet now scores **{fmt_pts(p)} pts** (marked verified). "
+        f"{left} still under review." , ephemeral=True)
 
 
 @tree.command(name="fetch", description="Mod: refresh likes/replies for all submissions now", guild=guild_obj)
@@ -573,11 +560,13 @@ async def fetch_now(inter: discord.Interaction):
 async def export(inter: discord.Interaction):
     buf = io.StringIO()
     w = csv.writer(buf)
-    w.writerow(["user", "user_id", "day", "url", "views", "likes", "replies", "rt_quotes", "tweet_pts", "reported_at", "verified"])
+    w.writerow(["user", "user_id", "day", "url", "views", "likes", "replies", "rt_quotes", "tweet_pts",
+                "author", "auto_fetched_at", "manually_awarded_at", "verified", "needs_review", "fetch_error"])
     for r in db.execute("SELECT * FROM submissions ORDER BY user_name, day").fetchall():
-        pts = tweet_points(r["views"], r["likes"], r["replies"], r["rtq"]) if r["reported_at"] else ""
+        pts = 0 if r["needs_review"] else tweet_points(r["views"], r["likes"], r["replies"], r["rtq"])
         w.writerow([r["user_name"], r["user_id"], r["day"], r["url"], r["views"], r["likes"], r["replies"], r["rtq"],
-                    pts, r["reported_at"], r["verified"]])
+                    pts, r["author_handle"], r["auto_fetched_at"], r["reported_at"], r["verified"],
+                    r["needs_review"], r["fetch_error"]])
     w.writerow([])
     w.writerow(["user_id", "pfp_week"])
     for r in db.execute("SELECT * FROM pfp_awards").fetchall():

@@ -24,21 +24,25 @@ the rules live: the tweet must exist, contain a visual, and tag @LeSharXverse �
 non-compliant tweets are rejected on the spot with the reason.
 
 When `/tally open` runs, the bot takes one final snapshot and freezes it (the
-"read once at the deadline" rule). `/report` exists only as a manual fallback
-for tweets the endpoints couldn't read (deleted/restricted, or all sources
-down); the bot alerts mods if the daily fetch failure rate exceeds 20%.
+"read once at the deadline" rule). Tweets no source can read at the snapshot
+(deleted, gone private, or endpoints down) are flagged: they **score 0** and
+appear in `/review` with their last-known numbers. A mod checks each one and
+either restores it with `/award` or leaves it forfeited. Creators never enter
+metrics — every manual number comes from a mod and is stamped in the export.
+The bot alerts mods if the daily fetch failure rate exceeds 20%.
 
 ## Commands
 
-**Creators**
-- `/submit <link>` — submit a tweet (validates the link, enforces 2/day UTC, blocks duplicates)
+**Creators** (submit a link — that's the whole job)
+- `/submit <link>` — submit a tweet (live rule checks: exists, has a visual, tags @LeSharXverse; enforces 2/day UTC; blocks duplicates)
 - `/withdraw <link>` — swap out one of today's submissions
 - `/mytweets` — your submissions, per-tweet points, and total
-- `/report` — at the deadline: enter each tweet's final numbers from your X analytics
 - `/leaderboard` — current standings (private view)
 
 **Mods** (role-gated)
-- `/tally open|close` — open the metrics-reporting window at the deadline
+- `/tally open|close` — take the final metrics snapshot at the deadline; unreadable tweets are flagged, score 0, and go to review
+- `/review` — list flagged tweets with last-known numbers
+- `/award <link> <views> <likes> <replies> <rt_quotes>` — manually set a reviewed tweet's metrics (points flow through the normal formula; marked verified)
 - `/pfp_award @member [week]` / `/pfp_revoke` — weekly +20 PFP bonuses
 - `/verify @member` — mark a member's reported numbers as checked (do this for the top 5 before finalizing)
 - `/post_leaderboard` — post standings publicly
