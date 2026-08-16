@@ -29,8 +29,8 @@ GUILD_ID = int(os.environ["GUILD_ID"])
 SUBMIT_CHANNEL_ID = int(os.environ.get("SUBMIT_CHANNEL_ID", "0"))
 ANNOUNCE_CHANNEL_ID = int(os.environ.get("ANNOUNCE_CHANNEL_ID", "0"))
 MOD_ROLE_ID = int(os.environ.get("MOD_ROLE_ID", "0"))
-SEASON_START = dt.date.fromisoformat(os.environ.get("SEASON_START", "2026-08-18"))
-SEASON_END = dt.date.fromisoformat(os.environ.get("SEASON_END", "2026-09-01"))
+ENV_SEASON_START = os.environ.get("SEASON_START", "2026-08-18")
+ENV_SEASON_END = os.environ.get("SEASON_END", "2026-09-01")
 DB_PATH = os.environ.get("DB_PATH", "creator_rewards.db")
 
 DAILY_CAP = 2
@@ -69,12 +69,23 @@ CREATE TABLE IF NOT EXISTS meta (
 );
 """)
 db.commit()
-for _col in ("auto_fetched_at TEXT", "fetch_error TEXT", "author_handle TEXT", "has_media INTEGER", "mention_ok INTEGER", "needs_review INTEGER DEFAULT 0", "author_avatar TEXT"):
+for _col in ("auto_fetched_at TEXT", "fetch_error TEXT", "author_handle TEXT", "has_media INTEGER", "mention_ok INTEGER", "needs_review INTEGER DEFAULT 0", "author_avatar TEXT", "season INTEGER DEFAULT 1"):
     try:
         db.execute(f"ALTER TABLE submissions ADD COLUMN {_col}")
         db.commit()
     except sqlite3.OperationalError:
         pass
+if "season" not in [r["name"] for r in db.execute("PRAGMA table_info(pfp_awards)").fetchall()]:
+    db.executescript("""
+    CREATE TABLE pfp_awards_new (
+      user_id INTEGER NOT NULL, week INTEGER NOT NULL, season INTEGER NOT NULL DEFAULT 1,
+      PRIMARY KEY (user_id, week, season)
+    );
+    INSERT INTO pfp_awards_new (user_id, week, season) SELECT user_id, week, 1 FROM pfp_awards;
+    DROP TABLE pfp_awards;
+    ALTER TABLE pfp_awards_new RENAME TO pfp_awards;
+    """)
+    db.commit()
 
 
 def meta_get(key, default=""):
@@ -93,8 +104,20 @@ def today_utc():
     return dt.datetime.now(dt.timezone.utc).date()
 
 
+def cur_season():
+    return int(meta_get("season", "1"))
+
+
+def season_start():
+    return dt.date.fromisoformat(meta_get("season_start", ENV_SEASON_START))
+
+
+def season_end():
+    return dt.date.fromisoformat(meta_get("season_end", ENV_SEASON_END))
+
+
 def season_active():
-    return SEASON_START <= today_utc() <= SEASON_END and meta_get("finalized") != "1"
+    return season_start() <= today_utc() <= season_end() and meta_get("finalized") != "1"
 
 
 def tally_open():
@@ -102,7 +125,7 @@ def tally_open():
 
 
 def current_week():
-    return max(0, (today_utc() - SEASON_START).days // 7)
+    return max(0, (today_utc() - season_start()).days // 7)
 
 
 def tweet_points(views, likes, replies, rtq):
@@ -110,20 +133,22 @@ def tweet_points(views, likes, replies, rtq):
 
 
 def user_points(user_id):
-    rows = db.execute("SELECT views, likes, replies, rtq FROM submissions WHERE user_id=? AND needs_review=0", (user_id,)).fetchall()
+    rows = db.execute("SELECT views, likes, replies, rtq FROM submissions WHERE user_id=? AND needs_review=0 AND season=?",
+                      (user_id, cur_season())).fetchall()
     pts = sum(tweet_points(r["views"], r["likes"], r["replies"], r["rtq"]) for r in rows)
-    pfp_weeks = db.execute("SELECT COUNT(*) AS c FROM pfp_awards WHERE user_id=?", (user_id,)).fetchone()["c"]
+    pfp_weeks = db.execute("SELECT COUNT(*) AS c FROM pfp_awards WHERE user_id=? AND season=?", (user_id, cur_season())).fetchone()["c"]
     return pts + pfp_weeks * PFP_WEEKLY_PTS, pfp_weeks
 
 
 def leaderboard_rows():
-    users = db.execute("SELECT DISTINCT user_id, user_name FROM submissions").fetchall()
+    users = db.execute("SELECT DISTINCT user_id, user_name FROM submissions WHERE season=?", (cur_season(),)).fetchall()
     out = []
     for u in users:
         pts, pfp_weeks = user_points(u["user_id"])
-        n_total = db.execute("SELECT COUNT(*) AS c FROM submissions WHERE user_id=?", (u["user_id"],)).fetchone()["c"]
-        n_rep = db.execute("SELECT COUNT(*) AS c FROM submissions WHERE user_id=? AND reported_at IS NOT NULL", (u["user_id"],)).fetchone()["c"]
-        n_ver = db.execute("SELECT COUNT(*) AS c FROM submissions WHERE user_id=? AND verified=1", (u["user_id"],)).fetchone()["c"]
+        args = (u["user_id"], cur_season())
+        n_total = db.execute("SELECT COUNT(*) AS c FROM submissions WHERE user_id=? AND season=?", args).fetchone()["c"]
+        n_rep = db.execute("SELECT COUNT(*) AS c FROM submissions WHERE user_id=? AND season=? AND reported_at IS NOT NULL", args).fetchone()["c"]
+        n_ver = db.execute("SELECT COUNT(*) AS c FROM submissions WHERE user_id=? AND season=? AND verified=1", args).fetchone()["c"]
         out.append({"user_id": u["user_id"], "name": u["user_name"], "pts": pts,
                     "pfp_weeks": pfp_weeks, "total": n_total, "reported": n_rep, "verified": n_ver})
     out.sort(key=lambda r: r["pts"], reverse=True)
@@ -228,7 +253,7 @@ async def fetch_tweet_metrics(session, tweet_id):
 
 async def fetch_all_metrics():
     """Refresh likes/replies for every submission. Returns (ok, failed)."""
-    rows = db.execute("SELECT id, tweet_id FROM submissions").fetchall()
+    rows = db.execute("SELECT id, tweet_id FROM submissions WHERE season=?", (cur_season(),)).fetchall()
     ok = failed = 0
     now = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
     async with aiohttp.ClientSession() as session:
@@ -296,7 +321,8 @@ async def submit(inter: discord.Interaction, link: str):
         who = "you" if dupe["user_id"] == inter.user.id else "someone else"
         await inter.response.send_message(f"That tweet was already submitted by {who}.", ephemeral=True)
         return
-    count = db.execute("SELECT COUNT(*) AS c FROM submissions WHERE user_id=? AND day=?", (inter.user.id, day)).fetchone()["c"]
+    count = db.execute("SELECT COUNT(*) AS c FROM submissions WHERE user_id=? AND day=? AND season=?",
+                       (inter.user.id, day, cur_season())).fetchone()["c"]
     if count >= DAILY_CAP:
         await inter.response.send_message(
             f"You've already submitted {DAILY_CAP} tweets today (UTC). Use `/withdraw` to swap one out.", ephemeral=True)
@@ -320,8 +346,8 @@ async def submit(inter: discord.Interaction, link: str):
         return
 
     now = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
-    db.execute("INSERT INTO submissions (user_id, user_name, url, tweet_id, day, created_at) VALUES (?,?,?,?,?,?)",
-               (inter.user.id, str(inter.user), canonical, tweet_id, day, now))
+    db.execute("INSERT INTO submissions (user_id, user_name, url, tweet_id, day, created_at, season) VALUES (?,?,?,?,?,?,?)",
+               (inter.user.id, str(inter.user), canonical, tweet_id, day, now, cur_season()))
     if metrics:
         db.execute("""UPDATE submissions SET views=?, likes=?, replies=?, rtq=?, author_handle=?,
                       author_avatar=?, has_media=?, mention_ok=?, auto_fetched_at=? WHERE tweet_id=?""",
@@ -350,8 +376,8 @@ async def withdraw(inter: discord.Interaction, link: str):
         await inter.response.send_message("That doesn't look like a tweet link.", ephemeral=True)
         return
     day = today_utc().isoformat()
-    cur = db.execute("DELETE FROM submissions WHERE user_id=? AND tweet_id=? AND day=? AND reported_at IS NULL",
-                     (inter.user.id, m.group(2), day))
+    cur = db.execute("DELETE FROM submissions WHERE user_id=? AND tweet_id=? AND day=? AND season=? AND reported_at IS NULL",
+                     (inter.user.id, m.group(2), day, cur_season()))
     db.commit()
     if cur.rowcount:
         await inter.response.send_message("Withdrawn. You can `/submit` a replacement today.", ephemeral=True)
@@ -361,7 +387,7 @@ async def withdraw(inter: discord.Interaction, link: str):
 
 @tree.command(name="mytweets", description="See your submissions and points this season", guild=guild_obj)
 async def mytweets(inter: discord.Interaction):
-    rows = db.execute("SELECT * FROM submissions WHERE user_id=? ORDER BY day", (inter.user.id,)).fetchall()
+    rows = db.execute("SELECT * FROM submissions WHERE user_id=? AND season=? ORDER BY day", (inter.user.id, cur_season())).fetchall()
     if not rows:
         await inter.response.send_message("No submissions yet this season. `/submit` your first tweet!", ephemeral=True)
         return
@@ -385,7 +411,7 @@ async def mytweets(inter: discord.Interaction):
 
 
 
-REVIEW_SQL = "SELECT * FROM submissions WHERE needs_review=1 ORDER BY user_name, day"
+REVIEW_SQL = "SELECT * FROM submissions WHERE needs_review=1 AND season=? ORDER BY user_name, day"
 
 
 @tree.command(name="leaderboard", description="Current season standings", guild=guild_obj)
@@ -409,7 +435,7 @@ def leaderboard_embed(final=False):
         colour=GOLD if final else BLUE,
         description="\n".join(lines))
     if not final:
-        e.set_footer(text=f"Season {SEASON_START} → {SEASON_END} · all metrics tracked automatically daily · "
+        e.set_footer(text=f"Season {cur_season()}: {season_start()} → {season_end()} · all metrics tracked automatically daily · "
                           "final snapshot at the deadline · ✅ = mod-verified")
     return e
 
@@ -428,7 +454,7 @@ async def tally(inter: discord.Interaction, state: app_commands.Choice[str]):
     if state.value == "open":
         ok, failed = await fetch_all_metrics()
         flagged = db.execute(
-            "UPDATE submissions SET needs_review=1 WHERE verified=0 AND "
+            "UPDATE submissions SET needs_review=1 WHERE season=" + str(cur_season()) + " AND verified=0 AND "
             "(fetch_error IS NOT NULL OR views IS NULL OR likes IS NULL OR replies IS NULL OR rtq IS NULL)").rowcount
         db.commit()
         if ch:
@@ -452,7 +478,7 @@ class PFPButton(discord.ui.Button):
 
     async def callback(self, inter: discord.Interaction):
         try:
-            db.execute("INSERT INTO pfp_awards (user_id, week) VALUES (?, ?)", (self.target_id, current_week()))
+            db.execute("INSERT INTO pfp_awards (user_id, week, season) VALUES (?, ?, ?)", (self.target_id, current_week(), cur_season()))
             db.commit()
         except sqlite3.IntegrityError:
             pass
@@ -466,15 +492,17 @@ class PFPButton(discord.ui.Button):
 @app_commands.check(mod_check)
 async def creator_list(inter: discord.Interaction):
     await inter.response.defer(ephemeral=True)
-    users = db.execute("SELECT DISTINCT user_id, user_name FROM submissions ORDER BY user_name").fetchall()
+    users = db.execute("SELECT DISTINCT user_id, user_name FROM submissions WHERE season=? ORDER BY user_name", (cur_season(),)).fetchall()
     if not users:
         await inter.followup.send("No creators yet this season.", ephemeral=True)
         return
     week = current_week()
     entries = []
     for u in users:
-        latest = db.execute("SELECT * FROM submissions WHERE user_id=? ORDER BY created_at DESC LIMIT 1", (u["user_id"],)).fetchone()
-        awarded = db.execute("SELECT 1 FROM pfp_awards WHERE user_id=? AND week=?", (u["user_id"], week)).fetchone() is not None
+        latest = db.execute("SELECT * FROM submissions WHERE user_id=? AND season=? ORDER BY created_at DESC LIMIT 1",
+                            (u["user_id"], cur_season())).fetchone()
+        awarded = db.execute("SELECT 1 FROM pfp_awards WHERE user_id=? AND week=? AND season=?",
+                             (u["user_id"], week, cur_season())).fetchone() is not None
         entries.append((u, latest, awarded))
     await inter.followup.send(
         f"**Week {week + 1} PFP checklist** — {len(entries)} creator(s). Avatars refresh with the daily fetch; "
@@ -503,7 +531,7 @@ async def creator_list(inter: discord.Interaction):
 async def pfp_award(inter: discord.Interaction, member: discord.Member, week: int = -1):
     w = current_week() if week < 0 else week
     try:
-        db.execute("INSERT INTO pfp_awards (user_id, week) VALUES (?, ?)", (member.id, w))
+        db.execute("INSERT INTO pfp_awards (user_id, week, season) VALUES (?, ?, ?)", (member.id, w, cur_season()))
         db.commit()
         await inter.response.send_message(f"+{fmt_pts(PFP_WEEKLY_PTS)} PFP bonus to {member.mention} for week {w + 1}. 🦈", ephemeral=True)
     except sqlite3.IntegrityError:
@@ -513,7 +541,7 @@ async def pfp_award(inter: discord.Interaction, member: discord.Member, week: in
 @tree.command(name="pfp_revoke", description="Mod: remove a PFP bonus", guild=guild_obj)
 @app_commands.check(mod_check)
 async def pfp_revoke(inter: discord.Interaction, member: discord.Member, week: int):
-    cur = db.execute("DELETE FROM pfp_awards WHERE user_id=? AND week=?", (member.id, week))
+    cur = db.execute("DELETE FROM pfp_awards WHERE user_id=? AND week=? AND season=?", (member.id, week, cur_season()))
     db.commit()
     await inter.response.send_message("Removed." if cur.rowcount else "No such award.", ephemeral=True)
 
@@ -521,7 +549,8 @@ async def pfp_revoke(inter: discord.Interaction, member: discord.Member, week: i
 @tree.command(name="verify", description="Mod: mark a member's reported metrics as checked", guild=guild_obj)
 @app_commands.check(mod_check)
 async def verify(inter: discord.Interaction, member: discord.Member):
-    cur = db.execute("UPDATE submissions SET verified=1 WHERE user_id=? AND reported_at IS NOT NULL", (member.id,))
+    cur = db.execute("UPDATE submissions SET verified=1 WHERE user_id=? AND season=? AND reported_at IS NOT NULL",
+                     (member.id, cur_season()))
     db.commit()
     await inter.response.send_message(f"Marked {cur.rowcount} reported tweet(s) from {member.mention} as verified ✅", ephemeral=True)
 
@@ -537,7 +566,7 @@ async def post_leaderboard(inter: discord.Interaction):
 @tree.command(name="finalize", description="Mod: lock the season and post final results", guild=guild_obj)
 @app_commands.check(mod_check)
 async def finalize(inter: discord.Interaction):
-    unreported = db.execute("SELECT COUNT(*) AS c FROM submissions WHERE needs_review=1").fetchone()["c"]
+    unreported = db.execute("SELECT COUNT(*) AS c FROM submissions WHERE needs_review=1 AND season=?", (cur_season(),)).fetchone()["c"]
     unverified_top = [r for r in leaderboard_rows()[:5] if r["reported"] and r["verified"] < r["reported"]]
     warnings = []
     if unreported:
@@ -560,7 +589,7 @@ async def finalize(inter: discord.Interaction):
 @tree.command(name="review", description="Mod: list tweets that need manual review", guild=guild_obj)
 @app_commands.check(mod_check)
 async def review(inter: discord.Interaction):
-    rows = db.execute(REVIEW_SQL).fetchall()
+    rows = db.execute(REVIEW_SQL, (cur_season(),)).fetchall()
     if not rows:
         await inter.response.send_message("Nothing needs review. 🦈", ephemeral=True)
         return
@@ -587,7 +616,7 @@ async def award(inter: discord.Interaction, link: str, views: int, likes: int, r
     if min(views, likes, replies, rt_quotes) < 0:
         await inter.response.send_message("Metrics can't be negative.", ephemeral=True)
         return
-    row = db.execute("SELECT * FROM submissions WHERE tweet_id=?", (m.group(2),)).fetchone()
+    row = db.execute("SELECT * FROM submissions WHERE tweet_id=? AND season=?", (m.group(2), cur_season())).fetchone()
     if not row:
         await inter.response.send_message("No submission with that link.", ephemeral=True)
         return
@@ -597,7 +626,7 @@ async def award(inter: discord.Interaction, link: str, views: int, likes: int, r
                 dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"), row["id"]))
     db.commit()
     p = tweet_points(views, likes, replies, rt_quotes)
-    left = db.execute("SELECT COUNT(*) AS c FROM submissions WHERE needs_review=1").fetchone()["c"]
+    left = db.execute("SELECT COUNT(*) AS c FROM submissions WHERE needs_review=1 AND season=?", (cur_season(),)).fetchone()["c"]
     await inter.response.send_message(
         f"Awarded: <@{row['user_id']}>'s tweet now scores **{fmt_pts(p)} pts** (marked verified). "
         f"{left} still under review." , ephemeral=True)
@@ -611,7 +640,7 @@ async def forfeit(inter: discord.Interaction, link: str):
     if not m:
         await inter.response.send_message("That doesn't look like a tweet link.", ephemeral=True)
         return
-    row = db.execute("SELECT * FROM submissions WHERE tweet_id=?", (m.group(2),)).fetchone()
+    row = db.execute("SELECT * FROM submissions WHERE tweet_id=? AND season=?", (m.group(2), cur_season())).fetchone()
     if not row:
         await inter.response.send_message("No submission with that link.", ephemeral=True)
         return
@@ -619,7 +648,7 @@ async def forfeit(inter: discord.Interaction, link: str):
                   reported_at=? WHERE id=?""",
                (dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"), row["id"]))
     db.commit()
-    left = db.execute("SELECT COUNT(*) AS c FROM submissions WHERE needs_review=1").fetchone()["c"]
+    left = db.execute("SELECT COUNT(*) AS c FROM submissions WHERE needs_review=1 AND season=?", (cur_season(),)).fetchone()["c"]
     await inter.response.send_message(
         f"Forfeited: <@{row['user_id']}>'s tweet scores 0 (recorded as a mod ruling). {left} still under review.", ephemeral=True)
 
@@ -631,30 +660,91 @@ async def fetch_now(inter: discord.Interaction):
     ok, failed = await fetch_all_metrics()
     msg = f"Refreshed {ok} tweet(s)."
     if failed:
-        bad = db.execute("SELECT url, fetch_error FROM submissions WHERE fetch_error IS NOT NULL LIMIT 10").fetchall()
+        bad = db.execute("SELECT url, fetch_error FROM submissions WHERE fetch_error IS NOT NULL AND season=? LIMIT 10", (cur_season(),)).fetchall()
         msg += f" {failed} failed:\n" + "\n".join(f"• <{b['url']}> — {b['fetch_error']}" for b in bad)
     await inter.followup.send(msg, ephemeral=True)
 
 
-@tree.command(name="export", description="Mod: export all season data as CSV", guild=guild_obj)
+@tree.command(name="export", description="Mod: export a season's data as CSV", guild=guild_obj)
+@app_commands.describe(season="Season number (default: current). Past seasons stay archived and exportable.")
 @app_commands.check(mod_check)
-async def export(inter: discord.Interaction):
+async def export(inter: discord.Interaction, season: int = 0):
+    season = season or cur_season()
     buf = io.StringIO()
     w = csv.writer(buf)
     w.writerow(["user", "user_id", "day", "url", "views", "likes", "replies", "rt_quotes", "tweet_pts",
                 "author", "auto_fetched_at", "manually_awarded_at", "verified", "needs_review", "fetch_error"])
-    for r in db.execute("SELECT * FROM submissions ORDER BY user_name, day").fetchall():
+    for r in db.execute("SELECT * FROM submissions WHERE season=? ORDER BY user_name, day", (season,)).fetchall():
         pts = 0 if r["needs_review"] else tweet_points(r["views"], r["likes"], r["replies"], r["rtq"])
         w.writerow([r["user_name"], r["user_id"], r["day"], r["url"], r["views"], r["likes"], r["replies"], r["rtq"],
                     pts, r["author_handle"], r["auto_fetched_at"], r["reported_at"], r["verified"],
                     r["needs_review"], r["fetch_error"]])
     w.writerow([])
     w.writerow(["user_id", "pfp_week"])
-    for r in db.execute("SELECT * FROM pfp_awards").fetchall():
+    for r in db.execute("SELECT * FROM pfp_awards WHERE season=?", (season,)).fetchall():
         w.writerow([r["user_id"], r["week"]])
     buf.seek(0)
     await inter.response.send_message(
-        file=discord.File(io.BytesIO(buf.getvalue().encode()), filename="creator_rewards.csv"), ephemeral=True)
+        file=discord.File(io.BytesIO(buf.getvalue().encode()), filename=f"creator_rewards_s{season}.csv"), ephemeral=True)
+
+
+class NewSeasonConfirm(discord.ui.View):
+    def __init__(self, start, end, discard):
+        super().__init__(timeout=120)
+        self.params = (start, end, discard)
+
+    @discord.ui.button(label="Confirm — start new season", style=discord.ButtonStyle.danger)
+    async def confirm(self, inter: discord.Interaction, button: discord.ui.Button):
+        start, end, discard = self.params
+        old = cur_season()
+        if discard:
+            db.execute("DELETE FROM submissions WHERE season=?", (old,))
+            db.execute("DELETE FROM pfp_awards WHERE season=?", (old,))
+        meta_set("season", str(old + 1))
+        meta_set("season_start", start)
+        meta_set("season_end", end)
+        meta_set("tally", "closed")
+        meta_set("finalized", "0")
+        meta_set("finalize_confirm", "0")
+        db.commit()
+        button.disabled = True
+        button.label = "Done"
+        await inter.response.edit_message(
+            content=f"Season {old} {'**discarded**' if discard else f'archived (export anytime with `/export season:{old}`)'} — "
+                    f"**Season {old + 1}** runs {start} → {end}. Fresh leaderboard, fresh submissions. 🦈", view=self)
+        ch = client.get_channel(ANNOUNCE_CHANNEL_ID or SUBMIT_CHANNEL_ID)
+        if ch and not discard:
+            await ch.send(f"# 🦈 CREATOR REWARDS — SEASON {old + 1}\nRunning **{start} → {end}**. "
+                          f"Submissions open with `/submit` on day one. LFJAWS!")
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, inter: discord.Interaction, button: discord.ui.Button):
+        for c in self.children:
+            c.disabled = True
+        await inter.response.edit_message(content="Cancelled — nothing changed.", view=self)
+
+
+@tree.command(name="season_new", description="Mod: archive (or discard) the current season and start a new one", guild=guild_obj)
+@app_commands.describe(
+    start="New season's first day, YYYY-MM-DD",
+    end="New season's last day, YYYY-MM-DD",
+    discard="Permanently DELETE the current season's data instead of archiving (for test runs)")
+@app_commands.check(mod_check)
+async def season_new(inter: discord.Interaction, start: str, end: str, discard: bool = False):
+    try:
+        s, e = dt.date.fromisoformat(start), dt.date.fromisoformat(end)
+        if e <= s:
+            raise ValueError
+    except ValueError:
+        await inter.response.send_message("Dates must be YYYY-MM-DD with end after start.", ephemeral=True)
+        return
+    n_subs = db.execute("SELECT COUNT(*) AS c FROM submissions WHERE season=?", (cur_season(),)).fetchone()["c"]
+    action = ("⚠️ **PERMANENTLY DELETE** the current season's data "
+              if discard else "Archive the current season (kept forever, exportable) ")
+    await inter.response.send_message(
+        f"Starting **Season {cur_season() + 1}** ({start} → {end}).\n{action}— "
+        f"{n_subs} submission(s) affected. Confirm?",
+        view=NewSeasonConfirm(start, end, discard), ephemeral=True)
 
 
 @tree.error
@@ -688,7 +778,7 @@ async def daily_reminder():
     ch = client.get_channel(ANNOUNCE_CHANNEL_ID or SUBMIT_CHANNEL_ID)
     if not ch:
         return
-    days_left = (SEASON_END - today_utc()).days
+    days_left = (season_end() - today_utc()).days
     if days_left == 0:
         await ch.send("⏰ **LAST DAY of the Creator Rewards season!** Get your final `/submit` in before midnight UTC. 🦈")
     elif days_left % 3 == 0:
@@ -702,7 +792,7 @@ async def on_ready():
         daily_reminder.start()
     if not daily_fetch.is_running():
         daily_fetch.start()
-    print(f"Logged in as {client.user} · season {SEASON_START} → {SEASON_END}")
+    print(f"Logged in as {client.user} · season {cur_season()}: {season_start()} → {season_end()}")
 
 
 client.run(TOKEN)
