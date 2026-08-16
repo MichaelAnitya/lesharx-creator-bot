@@ -42,7 +42,8 @@ The bot alerts mods if the daily fetch failure rate exceeds 20%.
 **Mods** (role-gated)
 - `/tally open|close` — take the final metrics snapshot at the deadline; unreadable tweets are flagged, score 0, and go to review
 - `/review` — list flagged tweets with last-known numbers
-- `/award <link> <views> <likes> <replies> <rt_quotes>` — manually set a reviewed tweet's metrics (points flow through the normal formula; marked verified)
+- `/award <link> <views> <likes> <replies> <rt_quotes>` — manually set a reviewed tweet's metrics (points flow through the normal formula; marked verified). For deleted-but-legit tweets, use the last-known numbers from `/review`.
+- `/forfeit <link>` — rule a reviewed tweet forfeited: 0 points, review closed, decision stamped in the export
 - `/pfp_award @member [week]` / `/pfp_revoke` — weekly +20 PFP bonuses
 - `/verify @member` — mark a member's reported numbers as checked (do this for the top 5 before finalizing)
 - `/post_leaderboard` — post standings publicly

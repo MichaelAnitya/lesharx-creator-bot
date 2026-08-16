@@ -510,9 +510,9 @@ async def review(inter: discord.Interaction):
             if r["auto_fetched_at"] else "never fetched"
         when = f" (fetched {r['auto_fetched_at'][:10]})" if r["auto_fetched_at"] else ""
         lines.append(f"• <@{r['user_id']}> <{r['url']}>\n  ↳ {r['fetch_error'] or 'missing metrics'} · {known}{when}")
-    msg = ("**Tweets under review** — these score 0 until you `/award` them. Check each link "
-           "manually; if it's legit, `/award` its real numbers (or the last-known ones below). "
-           "If it's deleted, leaving it at 0 = forfeited.\n\n" + "\n".join(lines))
+    msg = ("**Tweets under review** — each scores 0 until ruled on. If it's legit, `/award` its "
+           "real numbers (or the last-known ones below). If it's dead or unverifiable, `/forfeit` it. "
+           "Both close the review and are stamped in the export.\n\n" + "\n".join(lines))
     await inter.response.send_message(msg[:1990], ephemeral=True)
 
 
@@ -541,6 +541,27 @@ async def award(inter: discord.Interaction, link: str, views: int, likes: int, r
     await inter.response.send_message(
         f"Awarded: <@{row['user_id']}>'s tweet now scores **{fmt_pts(p)} pts** (marked verified). "
         f"{left} still under review." , ephemeral=True)
+
+
+@tree.command(name="forfeit", description="Mod: rule a reviewed tweet forfeited (0 points)", guild=guild_obj)
+@app_commands.describe(link="The flagged tweet's link")
+@app_commands.check(mod_check)
+async def forfeit(inter: discord.Interaction, link: str):
+    m = TWEET_RE.match(link.strip())
+    if not m:
+        await inter.response.send_message("That doesn't look like a tweet link.", ephemeral=True)
+        return
+    row = db.execute("SELECT * FROM submissions WHERE tweet_id=?", (m.group(2),)).fetchone()
+    if not row:
+        await inter.response.send_message("No submission with that link.", ephemeral=True)
+        return
+    db.execute("""UPDATE submissions SET views=0, likes=0, replies=0, rtq=0, needs_review=0, verified=1,
+                  reported_at=? WHERE id=?""",
+               (dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"), row["id"]))
+    db.commit()
+    left = db.execute("SELECT COUNT(*) AS c FROM submissions WHERE needs_review=1").fetchone()["c"]
+    await inter.response.send_message(
+        f"Forfeited: <@{row['user_id']}>'s tweet scores 0 (recorded as a mod ruling). {left} still under review.", ephemeral=True)
 
 
 @tree.command(name="fetch", description="Mod: refresh likes/replies for all submissions now", guild=guild_obj)
